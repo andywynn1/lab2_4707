@@ -125,6 +125,7 @@ InitBufferPool(void)
 			buf->wait_backend_pgprocno = INVALID_PGPROCNO;
 
 			buf->buf_id = i;
+			buf->last_access = 0;
 
 			/*
 			 * Initially link all the buffers together as unused. Subsequent

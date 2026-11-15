@@ -252,6 +252,9 @@ typedef struct BufferDesc
 	int			wait_backend_pgprocno;	/* backend of pin-count waiter */
 	int			freeNext;		/* link in freelist chain */
 	LWLock		content_lock;	/* to lock access to buffer contents */
+
+	/* Second-LRU: value of the global access counter at last access */
+	uint64		last_access;
 } BufferDesc;
 
 /*
@@ -397,6 +400,8 @@ extern IOContext IOContextForStrategy(BufferAccessStrategy strategy);
 extern BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy,
 									 uint32 *buf_state, bool *from_ring);
 extern void StrategyFreeBuffer(BufferDesc *buf);
+extern uint64 StrategyNextTimestamp(void);
+extern uint64 StrategyCurrentTimestamp(void);
 extern bool StrategyRejectBuffer(BufferAccessStrategy strategy,
 								 BufferDesc *buf, bool from_ring);
 
