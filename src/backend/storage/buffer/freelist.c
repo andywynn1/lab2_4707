@@ -20,6 +20,7 @@
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
+#include "lib/stringinfo.h"
 
 #define INT_ACCESS_ONCE(var)	((int)(*((volatile int *)&(var))))
 
@@ -306,7 +307,22 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		/* Second least recently used, or the only one if there is just one. */
 		victim_idx = (ncand >= 2) ? 1 : 0;
 
-		/* PART B: print "Candidate buffers: ..." here, using cand[0..ncand-1]. */
+		{
+			StringInfoData cbuf;
+			uint64 now = StrategyCurrentTimestamp();
+
+			initStringInfo(&cbuf);
+
+			for (i = 0; i < ncand; i++)
+			appendStringInfo(&cbuf, "%s%llu:%llu",
+					(i > 0) ? ", " : "",
+					(unsigned long long) (now - cand[i].last_access),
+					(unsigned long long) cand[i].last_access);
+
+			elog(LOG, "Candidate buffers: %s", cbuf.data);
+
+			pfree(cbuf.data);
+		}
 
 		/*
 		 * Lock the chosen buffer and make sure nobody pinned it since the
@@ -316,7 +332,16 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		local_buf_state = LockBufHdr(buf);
 		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
 		{
-			/* PART B: print "Replaced buffer: ..." and free space here. */
+			elog(LOG, "Replaced buffer: %llu:%llu",
+				(unsigned long long) (StrategyCurrentTimestamp() - buf->last_access),
+				(unsigned long long) buf->last_access);
+
+			if (local_buf_state & BM_VALID)
+				elog(LOG, "Available Page Space: %zu",
+			PageGetFreeSpace(BufferGetPage(BufferDescriptorGetBuffer(buf))));
+			else
+				elog(LOG, "Available Page Space: 0");
+
 			*buf_state = local_buf_state;
 			pfree(cand);
 			return buf;

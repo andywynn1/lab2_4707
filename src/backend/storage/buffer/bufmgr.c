@@ -2236,6 +2236,8 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 
 	Assert(!BufferIsLocal(b));
 
+	buf->last_access = StrategyNextTimestamp();
+
 	ref = GetPrivateRefCountEntry(b, true);
 
 	if (ref == NULL)
@@ -2259,6 +2261,7 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 
 			if (strategy == NULL)
 			{
+
 				/* Default case: increase usagecount unless already max. */
 				if (BUF_STATE_GET_USAGECOUNT(buf_state) < BM_MAX_USAGE_COUNT)
 					buf_state += BUF_USAGECOUNT_ONE;
@@ -2358,6 +2361,7 @@ PinBuffer_Locked(BufferDesc *buf)
 	 */
 	buf_state = pg_atomic_read_u32(&buf->state);
 	Assert(buf_state & BM_LOCKED);
+	buf->last_access = StrategyNextTimestamp();
 	buf_state += BUF_REFCOUNT_ONE;
 	UnlockBufHdr(buf, buf_state);
 
