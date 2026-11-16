@@ -1,0 +1,88 @@
+Students:
+1. Remi Wu (wu001664)
+2. Andrew Nguyen (nguy5745)
+3. Yonaf Erenna (erenn001)
+
+Brief Summary:
+We replaced PostgreSQL 16.0's clock-sweep buffer replacement policy with Second-LRU. Each shared buffer stores its most recent access timestamp from a shared integer counter. When a buffer is needed, we collect unpinned buffers, sort them from oldest to newest, and select the second entry, or the only entry when there is one candidate. We update timestamps on shared-buffer pins, retry selections affected by concurrent accesses, and print the candidate timestamps, the selected buffer's timestamp, and its page's available space after a successful selection.
+
+Detailed Changes:
+1. buf_internals.h: include/storage/buf_internals.h
+   - Added the uint64 last_access field to BufferDesc. Reads and writes after
+     initialization use the buffer header lock so concurrent backends cannot
+     overwrite a newer timestamp with an older value.
+   - Declared the shared counter access functions, CandidateBuf, and
+     BufferSelectionSnapshot. The snapshot carries the sorted candidates,
+     victim index, and one global timestamp from selection to output.
+   - Extended StrategyGetBuffer's interface to return the snapshot and declared
+     StrategyLogSelection. GetVictimBuffer is the caller of this interface.
+
+2. buf_init.c: backend/storage/buffer/buf_init.c
+   - Initialized last_access to zero for every shared buffer in InitBufferPool.
+     A zero value represents a buffer that has not been accessed yet.
+
+3. freelist.c: backend/storage/buffer/freelist.c
+   - Added a shared pg_atomic_uint64 counter to BufferStrategyControl. It starts
+     at 1, reserving 0 for initial buffer timestamps. StrategyNextTimestamp
+     returns the current value and then increments it; StrategyCurrentTimestamp
+     reads the counter without changing it.
+   - Replaced StrategyGetBuffer's freelist, strategy-ring, and clock-sweep
+     selection paths with a scan of shared buffers. Only buffers whose shared
+     reference count is zero enter the candidate array. usage_count does not
+     determine eligibility or victim selection.
+   - Sorted candidates by last_access, with buffer ID as a deterministic tie
+     breaker. Selected index 1 when at least two candidates exist, index 0 when
+     only one exists, and reported an error when none are available. This is
+     the second-oldest most recent access, not an LRU-2 access history.
+   - Retried if the global counter changed during the scan. After sorting,
+     locked the selected buffer and rechecked its pin count, its timestamp,
+     and the global counter. Returned it with its header lock still held, as
+     required by PostgreSQL's buffer allocation code. Retry loops check for
+     interrupts without holding a header lock.
+   - Removed the unused ClockSweepTick, GetBufferFromRing, and AddBufferToRing
+     helpers. The remaining PostgreSQL strategy interfaces are retained for
+     callers and I/O accounting, but ring and clock-sweep selection are bypassed.
+   - Added StrategyLogSelection to produce the three required output lines in
+     one LOG record. All time differences use snapshot.now - last_access.
+     Candidate timestamps are ordered oldest to newest, and the replaced
+     timestamp comes from the selected entry in the same snapshot.
+
+4. bufmgr.c: backend/storage/buffer/bufmgr.c
+   - Updated last_access in PinBuffer after establishing the pin, including the
+     repeated-pin path for an existing private reference. The counter fetch
+     and timestamp assignment occur together under the buffer header lock.
+   - Updated last_access in PinBuffer_Locked while its caller's header lock is
+     held. These hooks cover shared-buffer hits and allocations, including
+     PostgreSQL's existing internal pin operations.
+   - Passed the selection snapshot through GetVictimBuffer. After pinning the
+     selected buffer and releasing its header lock, obtained a conditional
+     shared content lock to read the old page's free space. A failed lock
+     acquisition releases the pin, discards the snapshot, and retries.
+   - Used PageGetFreeSpace for a valid old page and 0 for an invalid/unused
+     buffer. PageGetFreeSpace reports allocatable bytes after reserving space
+     for one item identifier. This reports the old selected page, before reuse.
+   - Kept PostgreSQL's dirty-page flushing and mapping-table invalidation checks.
+     Discarded snapshots on retry paths and printed only after the buffer was
+     successfully claimed. Logging and memory deallocation occur outside
+     buffer header spinlocks.
+
+Validation:
+We built with assertions enabled and tested with shared_buffers = 128kB. The
+provided buffer_add.sql dataset loaded 10,000 rows with the expected count and
+integer sums. Tests also exercised repeated scans, CHECKPOINT, VACUUM ANALYZE,
+and four concurrent clients with disjoint updates. A log validator checked
+candidate ordering, consistent time differences, second-candidate selection,
+and page-space bounds. Deterministic tests compiled the actual selection,
+logging, and pin functions against test shims and covered the handout sequence,
+timestamp ties, one/no unpinned candidates, concurrent-change retries, repeated
+pins, and 2,000 generated candidate sets. The same build and tests also passed on CSE host csel-remote-lnx-01 (Linux
+x86_64, GCC 15.2.0), including the full dataset and four concurrent clients.
+The accompanying test report records the actual outcomes on both platforms.
+
+Build Notes:
+PostgreSQL 16.0 predates GCC 15's default C23 mode. When configuring with GCC 15,
+set CFLAGS='-O2 -std=gnu99' before ./configure. The repository also omits bundled
+timezone data, so use --with-system-tzdata=/usr/share/zoneinfo when building this
+checkout. These are build-environment settings, not changes to the policy.
+After restoring the four files to the paths listed above, run make clean,
+make, and make install.

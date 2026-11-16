@@ -253,7 +253,7 @@ typedef struct BufferDesc
 	int			freeNext;		/* link in freelist chain */
 	LWLock		content_lock;	/* to lock access to buffer contents */
 
-	/* Second-LRU: value of the global access counter at last access */
+	/* Second-LRU: last access counter, protected by the buffer header lock */
 	uint64		last_access;
 } BufferDesc;
 
@@ -396,9 +396,27 @@ extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context,
 										  IOContext io_context, BufferTag *tag);
 
 /* freelist.c */
+/* A selection snapshot owned by the caller until it is logged or discarded. */
+typedef struct CandidateBuf
+{
+	int			buf_id;
+	uint64		last_access;
+} CandidateBuf;
+
+typedef struct BufferSelectionSnapshot
+{
+	CandidateBuf *candidates;
+	int			ncandidates;
+	int			victim_index;
+	uint64		now;
+} BufferSelectionSnapshot;
+
 extern IOContext IOContextForStrategy(BufferAccessStrategy strategy);
 extern BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy,
-									 uint32 *buf_state, bool *from_ring);
+									 uint32 *buf_state, bool *from_ring,
+									 BufferSelectionSnapshot *snapshot);
+extern void StrategyLogSelection(const BufferSelectionSnapshot *snapshot,
+								 Size page_space);
 extern void StrategyFreeBuffer(BufferDesc *buf);
 extern uint64 StrategyNextTimestamp(void);
 extern uint64 StrategyCurrentTimestamp(void);

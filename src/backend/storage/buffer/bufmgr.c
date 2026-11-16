@@ -1588,6 +1588,8 @@ GetVictimBuffer(BufferAccessStrategy strategy, IOContext io_context)
 	Buffer		buf;
 	uint32		buf_state;
 	bool		from_ring;
+	BufferSelectionSnapshot snapshot;
+	Size		page_space;
 
 	/*
 	 * Ensure, while the spinlock's not yet held, that there's a free refcount
@@ -1603,7 +1605,7 @@ again:
 	 * Select a victim buffer.  The buffer is returned with its header
 	 * spinlock still held!
 	 */
-	buf_hdr = StrategyGetBuffer(strategy, &buf_state, &from_ring);
+	buf_hdr = StrategyGetBuffer(strategy, &buf_state, &from_ring, &snapshot);
 	buf = BufferDescriptorGetBuffer(buf_hdr);
 
 	Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
@@ -1615,6 +1617,26 @@ again:
 	 * We shouldn't have any other pins for this buffer.
 	 */
 	CheckBufferIsPinnedOnce(buf);
+
+	/*
+	 * Read the old page while pinned and content-locked, never while holding
+	 * its header spinlock.  As with dirty-page flushing below, do not wait
+	 * for a content lock: a concurrent holder might be waiting for our pin.
+	 */
+	page_space = 0;
+	if (buf_state & BM_VALID)
+	{
+		LWLock *content_lock = BufferDescriptorGetContentLock(buf_hdr);
+
+		if (!LWLockConditionalAcquire(content_lock, LW_SHARED))
+		{
+			UnpinBuffer(buf_hdr);
+			pfree(snapshot.candidates);
+			goto again;
+		}
+		page_space = PageGetFreeSpace(BufferGetPage(buf));
+		LWLockRelease(content_lock);
+	}
 
 	/*
 	 * If the buffer was dirty, try to write it out.  There is a race
@@ -1652,6 +1674,7 @@ again:
 			 * to get another one.
 			 */
 			UnpinBuffer(buf_hdr);
+			pfree(snapshot.candidates);
 			goto again;
 		}
 
@@ -1676,6 +1699,7 @@ again:
 			{
 				LWLockRelease(content_lock);
 				UnpinBuffer(buf_hdr);
+				pfree(snapshot.candidates);
 				goto again;
 			}
 		}
@@ -1719,6 +1743,7 @@ again:
 	if ((buf_state & BM_TAG_VALID) && !InvalidateVictimBuffer(buf_hdr))
 	{
 		UnpinBuffer(buf_hdr);
+		pfree(snapshot.candidates);
 		goto again;
 	}
 
@@ -1731,6 +1756,10 @@ again:
 
 	CheckBufferIsPinnedOnce(buf);
 #endif
+
+	/* Log only successful selections, using one timestamp snapshot. */
+	StrategyLogSelection(&snapshot, page_space);
+	pfree(snapshot.candidates);
 
 	return buf;
 }
@@ -2236,8 +2265,6 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 
 	Assert(!BufferIsLocal(b));
 
-	buf->last_access = StrategyNextTimestamp();
-
 	ref = GetPrivateRefCountEntry(b, true);
 
 	if (ref == NULL)
@@ -2261,7 +2288,6 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 
 			if (strategy == NULL)
 			{
-
 				/* Default case: increase usagecount unless already max. */
 				if (BUF_STATE_GET_USAGECOUNT(buf_state) < BM_MAX_USAGE_COUNT)
 					buf_state += BUF_USAGECOUNT_ONE;
@@ -2311,6 +2337,14 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 	ref->refcount++;
 	Assert(ref->refcount > 0);
 	ResourceOwnerRememberBuffer(CurrentResourceOwner, b);
+
+	/* Serialize timestamp assignment with other pinners and victim scans. */
+	{
+		uint32 buf_state = LockBufHdr(buf);
+
+		buf->last_access = StrategyNextTimestamp();
+		UnlockBufHdr(buf, buf_state);
+	}
 	return result;
 }
 

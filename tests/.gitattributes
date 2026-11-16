@@ -1,0 +1,2 @@
+# Preserve the course-supplied fixtures, including their original line endings.
+lab2/dataset/* -whitespace

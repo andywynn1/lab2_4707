@@ -15,12 +15,13 @@
  */
 #include "postgres.h"
 
+#include "lib/stringinfo.h"
+#include "miscadmin.h"
 #include "pgstat.h"
 #include "port/atomics.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
-#include "lib/stringinfo.h"
 
 #define INT_ACCESS_ONCE(var)	((int)(*((volatile int *)&(var))))
 
@@ -99,77 +100,6 @@ typedef struct BufferAccessStrategyData
 }			BufferAccessStrategyData;
 
 
-/* Prototypes for internal functions */
-static BufferDesc *GetBufferFromRing(BufferAccessStrategy strategy,
-									 uint32 *buf_state);
-static void AddBufferToRing(BufferAccessStrategy strategy,
-							BufferDesc *buf);
-
-/*
- * ClockSweepTick - Helper routine for StrategyGetBuffer()
- *
- * Move the clock hand one buffer ahead of its current position and return the
- * id of the buffer now under the hand.
- */
-static inline uint32
-ClockSweepTick(void)
-{
-	uint32		victim;
-
-	/*
-	 * Atomically move hand ahead one buffer - if there's several processes
-	 * doing this, this can lead to buffers being returned slightly out of
-	 * apparent order.
-	 */
-	victim =
-		pg_atomic_fetch_add_u32(&StrategyControl->nextVictimBuffer, 1);
-
-	if (victim >= NBuffers)
-	{
-		uint32		originalVictim = victim;
-
-		/* always wrap what we look up in BufferDescriptors */
-		victim = victim % NBuffers;
-
-		/*
-		 * If we're the one that just caused a wraparound, force
-		 * completePasses to be incremented while holding the spinlock. We
-		 * need the spinlock so StrategySyncStart() can return a consistent
-		 * value consisting of nextVictimBuffer and completePasses.
-		 */
-		if (victim == 0)
-		{
-			uint32		expected;
-			uint32		wrapped;
-			bool		success = false;
-
-			expected = originalVictim + 1;
-
-			while (!success)
-			{
-				/*
-				 * Acquire the spinlock while increasing completePasses. That
-				 * allows other readers to read nextVictimBuffer and
-				 * completePasses in a consistent manner which is required for
-				 * StrategySyncStart().  In theory delaying the increment
-				 * could lead to an overflow of nextVictimBuffers, but that's
-				 * highly unlikely and wouldn't be particularly harmful.
-				 */
-				SpinLockAcquire(&StrategyControl->buffer_strategy_lock);
-
-				wrapped = expected % NBuffers;
-
-				success = pg_atomic_compare_exchange_u32(&StrategyControl->nextVictimBuffer,
-														 &expected, wrapped);
-				if (success)
-					StrategyControl->completePasses++;
-				SpinLockRelease(&StrategyControl->buffer_strategy_lock);
-			}
-		}
-	}
-	return victim;
-}
-
 /*
  * have_free_buffer -- a lockless check to see if there is a free buffer in
  *					   buffer pool.
@@ -210,15 +140,6 @@ StrategyCurrentTimestamp(void)
 	return pg_atomic_read_u64(&StrategyControl->lastAccessCounter);
 }
 
-/*
- * Second-LRU: one unpinned buffer considered for eviction.
- */
-typedef struct CandidateBuf
-{
-	int			buf_id;
-	uint64		last_access;
-} CandidateBuf;
-
 /* qsort comparator: oldest timestamp first, ties broken by buffer id */
 static int
 candidate_cmp(const void *a, const void *b)
@@ -252,7 +173,8 @@ candidate_cmp(const void *a, const void *b)
  *	return the buffer with the buffer header spinlock still held.
  */
 BufferDesc *
-StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_ring)
+StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_ring,
+				  BufferSelectionSnapshot *snapshot)
 {
 	BufferDesc *buf;
 	int			bgwprocno;
@@ -282,6 +204,9 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 
 	for (;;)
 	{
+		CHECK_FOR_INTERRUPTS();
+		snapshot->now = StrategyCurrentTimestamp();
+
 		/* Collect every unpinned buffer with its timestamp. */
 		ncand = 0;
 		for (i = 0; i < NBuffers; i++)
@@ -298,8 +223,15 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			UnlockBufHdr(buf, local_buf_state);
 		}
 
+		/* Discard the scan if any buffer was accessed while collecting it. */
+		if (StrategyCurrentTimestamp() != snapshot->now)
+			continue;
+
 		if (ncand == 0)
+		{
+			pfree(cand);
 			elog(ERROR, "no unpinned buffers available");
+		}
 
 		/* Oldest first. */
 		qsort(cand, ncand, sizeof(CandidateBuf), candidate_cmp);
@@ -307,47 +239,52 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		/* Second least recently used, or the only one if there is just one. */
 		victim_idx = (ncand >= 2) ? 1 : 0;
 
-		{
-			StringInfoData cbuf;
-			uint64 now = StrategyCurrentTimestamp();
-
-			initStringInfo(&cbuf);
-
-			for (i = 0; i < ncand; i++)
-			appendStringInfo(&cbuf, "%s%llu:%llu",
-					(i > 0) ? ", " : "",
-					(unsigned long long) (now - cand[i].last_access),
-					(unsigned long long) cand[i].last_access);
-
-			elog(LOG, "Candidate buffers: %s", cbuf.data);
-
-			pfree(cbuf.data);
-		}
-
 		/*
 		 * Lock the chosen buffer and make sure nobody pinned it since the
-		 * scan. If somebody did, rescan.
+		 * scan. Also retry if it was accessed and unpinned in the meantime.
 		 */
 		buf = GetBufferDescriptor(cand[victim_idx].buf_id);
 		local_buf_state = LockBufHdr(buf);
-		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 &&
+			buf->last_access == cand[victim_idx].last_access &&
+			StrategyCurrentTimestamp() == snapshot->now)
 		{
-			elog(LOG, "Replaced buffer: %llu:%llu",
-				(unsigned long long) (StrategyCurrentTimestamp() - buf->last_access),
-				(unsigned long long) buf->last_access);
-
-			if (local_buf_state & BM_VALID)
-				elog(LOG, "Available Page Space: %zu",
-			PageGetFreeSpace(BufferGetPage(BufferDescriptorGetBuffer(buf))));
-			else
-				elog(LOG, "Available Page Space: 0");
-
+			/* No allocation, logging, or freeing while the spinlock is held. */
+			snapshot->candidates = cand;
+			snapshot->ncandidates = ncand;
+			snapshot->victim_index = victim_idx;
 			*buf_state = local_buf_state;
-			pfree(cand);
 			return buf;
 		}
 		UnlockBufHdr(buf, local_buf_state);
 	}
+}
+
+/*
+ * Emit one complete record after GetVictimBuffer has successfully claimed the
+ * buffer and released all header/content locks.  The caller frees candidates.
+ */
+void
+StrategyLogSelection(const BufferSelectionSnapshot *snapshot, Size page_space)
+{
+	StringInfoData output;
+	uint64		victim_timestamp;
+	int			i;
+
+	initStringInfo(&output);
+	for (i = 0; i < snapshot->ncandidates; i++)
+		appendStringInfo(&output, "%s" UINT64_FORMAT ":" UINT64_FORMAT,
+						 (i > 0) ? ", " : "",
+						 snapshot->now - snapshot->candidates[i].last_access,
+						 snapshot->candidates[i].last_access);
+
+	victim_timestamp = snapshot->candidates[snapshot->victim_index].last_access;
+	elog(LOG, "Candidate buffers: %s\n"
+		 "Replaced buffer: " UINT64_FORMAT ":" UINT64_FORMAT "\n"
+		 "Available Page Space: %zu",
+		 output.data, snapshot->now - victim_timestamp, victim_timestamp,
+		 page_space);
+	pfree(output.data);
 }
 
 /*
@@ -515,8 +452,8 @@ StrategyInitialize(bool init)
 		/* No pending notification */
 		StrategyControl->bgwprocno = -1;
 
-		/* All buffers start with timestamp 0, so the counter starts at 0 */
-		pg_atomic_init_u64(&StrategyControl->lastAccessCounter, 0);
+		/* Reserve 0 for buffers that have never been accessed. */
+		pg_atomic_init_u64(&StrategyControl->lastAccessCounter, 1);
 	}
 	else
 		Assert(!init);
@@ -638,71 +575,6 @@ FreeAccessStrategy(BufferAccessStrategy strategy)
 	/* don't crash if called on a "default" strategy */
 	if (strategy != NULL)
 		pfree(strategy);
-}
-
-/*
- * GetBufferFromRing -- returns a buffer from the ring, or NULL if the
- *		ring is empty / not usable.
- *
- * The bufhdr spin lock is held on the returned buffer.
- */
-static BufferDesc *
-GetBufferFromRing(BufferAccessStrategy strategy, uint32 *buf_state)
-{
-	BufferDesc *buf;
-	Buffer		bufnum;
-	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
-
-
-	/* Advance to next ring slot */
-	if (++strategy->current >= strategy->nbuffers)
-		strategy->current = 0;
-
-	/*
-	 * If the slot hasn't been filled yet, tell the caller to allocate a new
-	 * buffer with the normal allocation strategy.  He will then fill this
-	 * slot by calling AddBufferToRing with the new buffer.
-	 */
-	bufnum = strategy->buffers[strategy->current];
-	if (bufnum == InvalidBuffer)
-		return NULL;
-
-	/*
-	 * If the buffer is pinned we cannot use it under any circumstances.
-	 *
-	 * If usage_count is 0 or 1 then the buffer is fair game (we expect 1,
-	 * since our own previous usage of the ring element would have left it
-	 * there, but it might've been decremented by clock sweep since then). A
-	 * higher usage_count indicates someone else has touched the buffer, so we
-	 * shouldn't re-use it.
-	 */
-	buf = GetBufferDescriptor(bufnum - 1);
-	local_buf_state = LockBufHdr(buf);
-	if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
-		&& BUF_STATE_GET_USAGECOUNT(local_buf_state) <= 1)
-	{
-		*buf_state = local_buf_state;
-		return buf;
-	}
-	UnlockBufHdr(buf, local_buf_state);
-
-	/*
-	 * Tell caller to allocate a new buffer with the normal allocation
-	 * strategy.  He'll then replace this ring element via AddBufferToRing.
-	 */
-	return NULL;
-}
-
-/*
- * AddBufferToRing -- add a buffer to the buffer ring
- *
- * Caller must hold the buffer header spinlock on the buffer.  Since this
- * is called with the spinlock held, it had better be quite cheap.
- */
-static void
-AddBufferToRing(BufferAccessStrategy strategy, BufferDesc *buf)
-{
-	strategy->buffers[strategy->current] = BufferDescriptorGetBuffer(buf);
 }
 
 /*
